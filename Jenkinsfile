@@ -1,9 +1,66 @@
-// Jenkinsfile — CI/CD pipeline with parameterized branch + environment
-// Architecture: on-demand Docker agents. The Jenkins controller runs persistently,
-// agents are ephemeral containers launched per-stage via the Docker Pipeline plugin.
+// =====================================================================================
+// Jenkinsfile — SINGLE SOURCE OF TRUTH for this pipeline's contract.
+// If you change anything about how this pipeline behaves, change it HERE.
 //
-// Container naming convention: branch-environment-date-hash
-// Example: feature-x-dev-20260825-a1b2c3
+// What this pipeline does:
+//   1. Launches an ephemeral Docker agent (Verify stage) to prove the on-demand
+//      agent model + host Docker socket work.
+//   2. Checks out the selected GitHub branch.
+//   3. Builds an nginx-based static-site image, substituting IMAGE_TAG and
+//      DOCKERHUB_USER placeholders in index.html via Docker ARG → sed.
+//   4. Pushes the image to Docker Hub, tagged per the convention below.
+//
+// Architecture: on-demand Docker agents. The Jenkins controller runs persistently;
+// agents are ephemeral containers launched per-stage via the Docker Pipeline plugin
+// and torn down when each stage finishes. No idle containers between builds.
+//
+// Container naming convention (also used as the Docker image tag):
+//   <branch>-<environment>-<YYYYMMDD>-<short-sha>
+//   Example: main-dev-20260825-843b924
+//
+// Final pushed image:
+//   <dockerhub-user>/<dockerhub-image>:<branch>-<environment>-<YYYYMMDD>-<short-sha>
+//
+// Parameters (all declared here — DO NOT also enable "This project is parameterized"
+// in the Jenkins UI or the job will fail with duplicate-parameter errors):
+//   BRANCH        — Git Parameter (PT_BRANCH), dropdown is populated dynamically from
+//                   the GitHub repo. Default: main. Credential required if the repo is
+//                   private: github-pat (Username + password, GitHub PAT).
+//   ENVIRONMENT   — Choice: dev / staging / prod. Default: dev.
+//   DOCKER_IMAGE  — String. Docker Hub repo path WITHOUT the tag. Default:
+//                   bayajidph/jenkins-poc. The user (org) segment is extracted from
+//                   before the first "/" and used to substitute DOCKERHUB_USER.
+//   GIT_REPO      — String. GitHub repo URL to checkout. Default:
+//                   https://github.com/bayajidph/jenkins-poc.git.
+//
+// Required Jenkins credentials (add via Manage Jenkins → Credentials):
+//   github-pat      — Username with password, GitHub PAT (only needed for private repos).
+//   dockerhub-creds — Username with password, Docker Hub username + Docker Hub PAT.
+//                     IMPORTANT: create these via the Jenkins UI. Pasting the value
+//                     through a bash heredoc + --data-urlencode has been observed to
+//                     inject ANSI escape codes into the stored value, which surfaces
+//                     later as "unknown: malformed HTTP Authorization header" at push.
+//
+// Required Jenkins plugins:
+//   git (default), pipeline (default), credentials-binding (default),
+//   plain-credentials (default), Docker Pipeline (docker-workflow),
+//   Git Parameter (git-parameter).
+//
+// First-build gotchas (these always hit on a fresh job — they are NOT bugs):
+//   1. "script not yet approved for use" — fix at
+//      Manage Jenkins → In-process Script Approval → Approve each pending hash,
+//      or run this in the script console once:
+//          import org.jenkinsci.plugins.scriptsecurity.scripts.*
+//          def sa = ScriptApproval.get()
+//          sa.pendingScripts.each { sa.approveScript(it.hash) }
+//          sa.save()
+//      Then click Build with Parameters again.
+//   2. The first build of each stage downloads jenkins/agent:latest-jdk17 (~700 MB)
+//      and pulls nginx:alpine during Build. Subsequent builds reuse the cache.
+//
+// docker-compose.yml must run Jenkins as root with /var/run/docker.sock bind-mounted
+// and jenkins_home as a named volume. See docker-compose.yml in this repo.
+// =====================================================================================
 
 pipeline {
     agent none
@@ -45,16 +102,13 @@ pipeline {
     environment {
         DATE_TAG       = sh(script: "date +%Y%m%d",               returnStdout: true).trim()
         SHORT_HASH     = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-        // Naming convention: branch-environment-date-hash
         CONTAINER_NAME = "${params.BRANCH}-${params.ENVIRONMENT}-${DATE_TAG}-${SHORT_HASH}"
         FULL_IMAGE     = "${params.DOCKER_IMAGE}:${CONTAINER_NAME}"
     }
 
     stages {
 
-        // ============================================================
-        //  STAGE 0 — Automated test: prove the agent-on-demand model works.
-        // ============================================================
+        // STAGE 0 — Automated test: prove the agent-on-demand model works.
         stage('Verify Agents (Test)') {
             agent {
                 docker {

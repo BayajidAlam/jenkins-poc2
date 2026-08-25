@@ -80,8 +80,8 @@ cheat-sheet; the full step-by-step is in §7 and §8.
 | # | Secret | Where to get it (exact path) |
 |---|---|---|
 | 1 | **Administrator password** (unlock Jenkins at first boot) | Run on the host: `docker exec jenkins-controller cat /var/jenkins_home/secrets/initialAdminPassword`. Jenkins also shows it once on the unlock screen if you hit the right URL with cookies disabled. |
-| 2 | **`JENKINS_AGENT_BUILD_SECRET`** (JNLP secret for the `agent-build` node) | After creating the node in §8, open `http://<host>:8080/computer/agent-build/slave-agent.jnlp`. The **first `<argument>` inside `<application-desc>` is the secret**. Same value is shown under *Manage Jenkins → Nodes → agent-build → "Agent password" / "JNLP"* on the node's page. |
-| 3 | **`JENKINS_AGENT_PUSH_SECRET`** (JNLP secret for the `agent-push` node) | Same as #2 but at `…/computer/agent-push/slave-agent.jnlp`, or *Manage Jenkins → Nodes → agent-push* (see §8). |
+| 2 | **`JENKINS_AGENT_BUILD_SECRET`** (JNLP secret for the `agent-build` node) | After creating the node in §8, on the node's landing page (Manage Jenkins → Nodes → agent-build), scroll to the launch command block. You'll see `java -jar agent.jar -secret <64-hex> -name agent-build ...`. The hex between `-secret ` and the next `-` is the JNLP secret. Same value is at `http://<host>:8080/computer/agent-build/slave-agent.jnlp` - the first `<argument>` inside `<application-desc>`. |
+| 3 | **`JENKINS_AGENT_PUSH_SECRET`** (JNLP secret for the `agent-push` node) | Same as #2 but on the `agent-push` node page, or at `…/computer/agent-push/slave-agent.jnlp` (see §8). |
 
 All three are **per-installation** - they change if you wipe the `jenkins_home`
 volume (`docker compose down -v`) and have to redo the setup wizard and node
@@ -117,21 +117,47 @@ EOF
 
 ## 6. Bring the stack up
 
+`docker-compose`'s `${VAR:?...}` guard refuses to start **anything** until the
+two JNLP secrets in `.env` exist as non-empty strings. But you cannot get the
+real JNLP secrets until the controller is up and you've created the nodes via
+UI (§7-§8). To break the deadlock, put throwaway placeholders in `.env` first:
+
+```bash
+# .env - placeholder values; replaced with the real JNLP secrets in §8.5
+JENKINS_AGENT_BUILD_SECRET=phase-a-placeholder
+JENKINS_AGENT_PUSH_SECRET=phase-a-placeholder
+```
+
+Then bring the stack up:
+
 ```bash
 docker compose up -d
 docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 ```
 
-You should see one container - the controller. The agents stay stopped until
-you've created their nodes in §8 and put the secrets in `.env`.
+You should see all three containers - the controller AND both agents:
 
 ```
 NAMES                  STATUS          PORTS
 jenkins-controller     Up X minutes    0.0.0.0:8080->8080, 0.0.0.0:50000->50000
+jenkins-agent-build    Up X minutes
+jenkins-agent-push     Up X minutes
 ```
 
-Confirm the host Docker socket is reachable from inside the controller (the
-agents will need this too once they start):
+The two agents start but immediately fail their JNLP handshake (`Handshake
+error` in their logs) because the controller doesn't have nodes with the
+placeholder secret. That is expected - leave them running. They will come
+online once you paste real JNLP secrets into `.env` and re-run
+`docker compose up -d` after §8.
+
+> **Why placeholders are needed:** the strict `${VAR:?...}` guard in
+> compose refuses empty strings too, and there is no way to scope
+> `docker compose up -d` to a single service - all services in the file
+> are validated. The placeholders unblock Compose's interpolation; the
+> agents then sit in retry-loop until §8.
+
+Confirm the host Docker socket is reachable from inside the controller
+(the agents will need this too once they start):
 
 ```bash
 docker exec jenkins-controller docker version --format '{{.Server.Version}}'
@@ -242,24 +268,26 @@ Click **Save**.
 page. **This is where the JNLP secret lives** - it was just generated.
 
 Scroll down past the "Status" / "Connect" / "Owner" sections to a section
-that is labeled one of:
-- **"Agent password"** (older Jenkins), or
-- **"Agent → JNLP → Secret"** (newer Jenkins).
-
-It will either show a copyable hex string labeled *Secret*, or a launch
-command like:
+labeled **"Launch agent by executing this command in your workstation"**.
+You'll see a `java -jar agent.jar ...` line that contains
+`-secret <64-hex>`. Example:
 
 ```
-Secret: 9f3c8a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f
-OR
-java -jar agent.jar -jnlpUrl .../agent-build/agent.jnlp -secret 9f3c8a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f <node-name>
+curl -sO http://<host>:8080/jnlpJars/agent.jar
+java -jar agent.jar -url http://<host>:8080/ -secret 9f3c8a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f -name "agent-build" -webSocket -workDir "/home/jenkins/agent"
 ```
 
-Copy that hex string. That is **`JENKINS_AGENT_BUILD_SECRET`**.
+Copy the 64-character hex string between `-secret ` and the next `-`.
+That is **`JENKINS_AGENT_BUILD_SECRET`**.
 
-> The secret is 64 hex characters. If you see a much shorter or longer
-> value, double-check you copied the right field (don't grab the
-> `<node-name>` token, for example).
+> The secret is **64 hex characters**. If you see a much shorter or
+> longer value, double-check you copied the right field (don't grab the
+> `-name "agent-build"` portion, for example).
+>
+> Older Jenkins versions showed the secret under a section literally
+> labeled "Agent password" or "JNLP → Secret". Modern Jenkins
+> (`>= 2.420`) shows it only inside the launch command. Both forms
+> contain the same hex; copy from whichever your version shows.
 
 ### 8.3 Phase B - create the SECOND node (`agent-push`)
 
@@ -278,24 +306,27 @@ Secret" section on the new node's landing page. That is
 ### 8.4 Alternative ways to retrieve the JNLP secrets
 
 If you saved the nodes but missed the secret, you don't need to redo them.
-Two retrieval paths:
+Two reliable retrieval paths:
 
-**Path A - directly from the controller's volume** (no UI needed):
+> **Note:** Jenkins no longer persists JNLP secrets to disk as a
+> `secret.xml` file under `jenkins_home/nodes/<name>/`. The secret is
+> computed on demand and only served through the node UI launch command
+> or the `slave-agent.jnlp` descriptor. Both paths below show it.
 
-```bash
-# JENKINS_AGENT_BUILD_SECRET
-docker exec jenkins-controller cat \
-  /var/jenkins_home/nodes/agent-build/secret.xml
+**Path A - via the node UI launch command.** The full node landing page
+shows the secret as part of the launch command:
 
-# JENKINS_AGENT_PUSH_SECRET
-docker exec jenkins-controller cat \
-  /var/jenkins_home/nodes/agent-push/secret.xml
+```
+Manage Jenkins → Nodes → agent-build → scroll to "Launch agent by
+  executing this command in your workstation" → the `java -jar agent.jar
+  -secret <hex> ...` line
 ```
 
-Each prints one line like `<secret>9f3c…e2</secret>`. The hex string
-between the `<secret>` tags is the value to paste into `.env`.
+The hex between `-secret ` and the next `-` is your
+`JENKINS_AGENT_BUILD_SECRET`.
 
-**Path B - via the JNLP descriptor URL** (browser):
+**Path B - via the JNLP descriptor URL** (browser or curl, no login UI
+required):
 
 ```
 http://<host>:8080/computer/agent-build/slave-agent.jnlp
@@ -304,11 +335,20 @@ http://<host>:8080/computer/agent-push/slave-agent.jnlp
 
 If Jenkins asks you to log in first, do that, then reload. The XML body
 has `<argument>some-hex-string</argument>` as the **first `<argument>`
-inside `<application-desc>`** - that hex string is the JNLP secret.
+inside `<application-desc>`** - that hex string is the JNLP secret
+(64 chars, hex).
+
+If you can `curl` the controller, this is the fastest retrieval:
+
+```bash
+curl -s -u admin:<admin-password> \
+  http://<host>:8080/computer/agent-build/slave-agent.jnlp \
+  | grep -oE '<argument>[a-f0-9]{64}</argument>' | head -1
+```
 
 > **Truncated secret warning:** if the hex string in the JNLP URL ends
 > with `…` or is shorter than 64 chars, the browser has line-wrapped it.
-> Use Path A above - the on-disk `secret.xml` is the canonical source.
+> Use the `curl` recipe above - the live XML is the canonical source.
 
 ### 8.5 Put the secrets in `.env`, restart the stack
 

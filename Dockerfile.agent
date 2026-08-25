@@ -1,17 +1,17 @@
 # =====================================================================================
-# Dockerfile.agent — Custom Jenkins agent with docker CLI installed.
+# Dockerfile.agent - Custom Jenkins agent with docker CLI installed.
 #
 # Why this exists:
-#   The official `jenkins/agent:latest-jdk17` image does NOT include the docker
-#   CLI. Our Jenkinsfile runs `docker build` and `docker push` from inside the
-#   agent container (DooD pattern via /var/run/docker.sock), so we need a docker
-#   CLI inside the agent.
+#   The official `jenkins/inbound-agent:latest-jdk17` image does NOT include the
+#   docker CLI. Our Jenkinsfile runs `docker build` and `docker push` from
+#   inside the agent container (DooD pattern via /var/run/docker.sock), so we
+#   need a docker CLI inside the agent.
 #
 # Used by:
 #   This image is built ONCE and reused by both agent-build and agent-push
 #   services in docker-compose.yml. Both services inherit `JENKINS_URL`,
-#   `JENKINS_SECRET`, `JENKINS_AGENT_NAME`, and `JENKINS_AGENT_LABELS` from
-#   the upstream `jenkins/agent` entrypoint — no extra wiring required.
+#   `JENKINS_SECRET`, and `JENKINS_AGENT_NAME` from the upstream
+#   `jenkins/inbound-agent` entrypoint - no extra wiring required.
 #
 # Build and tag:
 #   docker build -f Dockerfile.agent -t jenkins-agent-with-docker:latest-jdk17 .
@@ -20,11 +20,11 @@
 # ~520 MB, so building once and reusing it is recommended.
 # =====================================================================================
 
-FROM jenkins/agent:latest-jdk17
+FROM jenkins/inbound-agent:latest-jdk17
 
 USER root
 
-# Install docker CLI (NOT the daemon — the daemon is the host's, exposed via socket)
+# Install docker CLI (NOT the daemon - the daemon is the host's, exposed via socket)
 # We use the official docker convenience script to get a docker-cli version
 # compatible with the host's daemon. apt's docker.io on debian-slim can lag
 # behind by a minor version.
@@ -45,5 +45,20 @@ RUN apt-get update \
 # Drop back to the jenkins user so the agent runs with the expected identity
 USER jenkins
 
-# Sanity check — should print the docker CLI version
+# Sanity check - should print the docker CLI version
 RUN docker --version
+
+# =====================================================================================
+# Grant the jenkins user permission to talk to the host's /var/run/docker.sock
+# (which is bind-mounted into the agent at runtime).
+#
+# The host socket is typically root:docker mode 660. The jenkins user inside the
+# container must therefore be a member of group id 999 (which we map to "docker"
+# via the GROUP_ID build arg) so it can read/write the socket. We default to
+# 999 which is the standard gid on Debian-based host images.
+# =====================================================================================
+ARG GROUP_ID=999
+USER root
+RUN groupadd -g ${GROUP_ID} docker-host 2>/dev/null || true \
+ && usermod -aG docker-host jenkins
+USER jenkins

@@ -5,7 +5,7 @@
 
 FROM nginx:alpine
 
-# Default build args — Jenkinsfile will override these per build
+# Default build args - Jenkinsfile will override these per build
 ARG IMAGE_TAG=IMAGE_TAG_PLACEHOLDER
 ARG DOCKERHUB_USER=DOCKERHUB_USER
 

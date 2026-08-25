@@ -1,4 +1,4 @@
-# Local secrets — never commit
+# Local secrets - never commit
 .env
 
 # Jenkins init / setup artifacts

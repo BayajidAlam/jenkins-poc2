@@ -1,18 +1,32 @@
-version: "3.8"
+name: jenkins-poc2
 
-# This stack runs ONLY the Jenkins controller.
-# The build agent and push agent are NOT here — they are launched
-# on-demand by the Jenkinsfile itself via the Docker Pipeline plugin.
+# =====================================================================================
+# This stack runs the Jenkins controller AND two persistent agents:
+#   - jenkins         : the Jenkins controller (UI on :8080, JNLP on :50000)
+#   - agent-build     : persistent agent labelled "build" — runs Checkout + Build
+#   - agent-push      : persistent agent labelled "push"  — runs Push to Docker Hub
 #
-# On-demand strategy: agents spin up when a build starts, shut down when done.
-# Resource-efficient, clean isolation per build, no idle container cost.
+# All three services are long-running. The agents are registered to the controller
+# on first boot using the JNLP startup logic baked into `jenkins/agent` images.
+#
+# The agents share the host's Docker engine through /var/run/docker.sock
+# (Docker-out-of-Docker pattern), so `docker build` / `docker push` inside an
+# agent actually execute on the host daemon.
+#
+# To start the stack:
+#     docker compose up -d
+#
+# First-boot agent secret:
+#     docker exec jenkins-controller cat /var/jenkins_home/secrets/agent-secret
+# (Or whatever path your compose wiring exposes — see README §3.)
+# =====================================================================================
 
 services:
   jenkins:
     image: jenkins/jenkins:lts-jdk17
     container_name: jenkins-controller
     restart: unless-stopped
-    user: root   # Required so the container can launch sibling agent containers via the mounted Docker socket
+    user: root   # Required so the controller can register/manage sibling agents via JNLP
     ports:
       - "8080:8080"    # Web UI
       - "50000:50000"  # JNLP — agents dial back to the controller on this port
@@ -21,17 +35,68 @@ services:
       # jobs, credentials, plugins, and build history live here.
       - jenkins_home:/var/jenkins_home
 
-      # Bind-mount the host Docker socket so the Jenkins container can
-      # launch agent containers using the host's Docker daemon.
-      # This is the standard Docker-out-of-Docker pattern (DooD):
-      # the agent containers share the host's Docker engine, avoiding
-      # the complications of true Docker-in-Docker (DinD).
+      # Bind-mount the host Docker socket so agents can run docker build/push.
+      # We mount it on the controller too so the controller can manage agent
+      # containers (inspect, logs) via the same socket.
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - jenkins_net
     environment:
-      # Allow long JNLP connections from agents
       - JENKINS_OPTS=--httpPort=8080
+
+  # ---------------------------------------------------------------------------
+  # agent-build : persistent agent, label "build"
+  # Runs the Checkout + Build stages. Has docker CLI for `docker build`.
+  # Always-on (restart: unless-stopped) so Jenkins doesn't pay container
+  # spin-up cost per build.
+  # ---------------------------------------------------------------------------
+  agent-build:
+    image: jenkins-agent-with-docker:latest-jdk17
+    container_name: jenkins-agent-build
+    restart: unless-stopped
+    user: jenkins
+    # Build args come from environment (set under `environment:` below) so
+    # the agent can dial back to the controller on first boot.
+    environment:
+      - JENKINS_URL=http://jenkins-controller:8080
+      - JENKINS_SECRET=${JENKINS_AGENT_SECRET:?set JENKINS_AGENT_SECRET in .env or compose env}
+      - JENKINS_AGENT_NAME=agent-build
+      - JENKINS_AGENT_LABELS=build docker
+      - JENKINS_WEB_SOCKET=true
+    volumes:
+      # Mount the host Docker socket so this agent can run `docker build`
+      # against the host daemon (DooD). The image built here is then pushed
+      # by agent-push in the next stage.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - jenkins_net
+    depends_on:
+      - jenkins
+
+  # ---------------------------------------------------------------------------
+  # agent-push : persistent agent, label "push"
+  # Runs the Push to Docker Hub stage. Has docker CLI for `docker login`
+  # and `docker push`. Always-on.
+  # ---------------------------------------------------------------------------
+  agent-push:
+    image: jenkins-agent-with-docker:latest-jdk17
+    container_name: jenkins-agent-push
+    restart: unless-stopped
+    user: jenkins
+    environment:
+      - JENKINS_URL=http://jenkins-controller:8080
+      - JENKINS_SECRET=${JENKINS_AGENT_SECRET:?set JENKINS_AGENT_SECRET in .env or compose env}
+      - JENKINS_AGENT_NAME=agent-push
+      - JENKINS_AGENT_LABELS=push docker
+      - JENKINS_WEB_SOCKET=true
+    volumes:
+      # Same DooD socket mount — agent-push needs the docker CLI to push
+      # the image that agent-build produced.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - jenkins_net
+    depends_on:
+      - jenkins
 
 networks:
   jenkins_net:

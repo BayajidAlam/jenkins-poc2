@@ -1,11 +1,23 @@
 // =====================================================================================
-// Jenkinsfile — TWO-AGENT MODEL (on-demand Docker containers)
-//   - build-agent : Checkout + Build (all build-related stages) — one ephemeral container
-//   - push-agent  : Push to Docker Hub (all push-related stages) — one ephemeral container
+// Jenkinsfile — TWO-AGENT MODEL (always-on compose services)
 //
-// Architecture: on-demand Docker agents. The Jenkins controller runs persistently;
-// agents are ephemeral containers launched per-stage via the Docker Pipeline plugin
-// and torn down when each stage finishes. No idle containers between builds.
+// Architecture: persistent agents defined in docker-compose.yml. The Jenkins
+// controller runs persistently, and so do the two agents — agent-build and
+// agent-push. They connect to the controller over JNLP at first boot using
+// JENKINS_URL / JENKINS_SECRET / JENKINS_AGENT_NAME env vars set in compose.
+// There is no per-stage container spin-up cost; stages run on whichever agent
+// matches the requested label.
+//
+// Agent routing:
+//   - agent { label 'build' } -> jenkins-agent-build container
+//                                (Checkout + Build stages)
+//   - agent { label 'push'  } -> jenkins-agent-push container
+//                                (Push to Docker Hub stage)
+//
+// Both agents run the same custom image (jenkins-agent-with-docker built from
+// Dockerfile.agent), and both share the host's Docker engine through
+// /var/run/docker.sock (Docker-out-of-Docker), so docker build / docker push
+// inside the agent actually execute on the host daemon.
 //
 // Container naming convention (also used as the Docker image tag):
 //   <branch>-<environment>-<YYYYMMDD>-<short-sha>
@@ -36,16 +48,13 @@
 //
 // Required Jenkins plugins:
 //   git (default), pipeline (default), credentials-binding (default),
-//   plain-credentials (default), Docker Pipeline (docker-workflow),
-//   Git Parameter (git-parameter).
+//   plain-credentials (default), Git Parameter (git-parameter).
 //
 // Agent image (custom — see Dockerfile.agent):
-//   We do NOT use the upstream `jenkins/agent:latest-jdk17` because that image
-//   has no docker CLI. Our pipeline runs `docker build` and `docker push`
-//   inside the agent (DooD via /var/run/docker.sock), so we need a docker CLI
-//   in the agent. Build the custom image once with:
-//       docker build -f Dockerfile.agent -t jenkins-agent-with-docker:latest-jdk17 .
-//   The custom image is ~520 MB and is reused across all builds.
+//   Built once with `docker build -f Dockerfile.agent -t
+//   jenkins-agent-with-docker:latest-jdk17 .` and reused by both services in
+//   docker-compose.yml. The image includes the docker CLI so the agents can
+//   run docker build / docker push via the host's Docker socket.
 //
 // First-build gotchas (these always hit on a fresh job — they are NOT bugs):
 //   1. "script not yet approved for use" — fix at
@@ -56,12 +65,10 @@
 //          sa.pendingScripts.each { sa.approveScript(it.hash) }
 //          sa.save()
 //      Then click Build with Parameters again.
-//   2. The first build pulls jenkins-agent-with-docker:latest-jdk17 (~520 MB,
-//      built locally from Dockerfile.agent) and nginx:alpine during Build.
-//      Subsequent builds reuse the cache.
-//
-// docker-compose.yml must run Jenkins as root with /var/run/docker.sock bind-mounted
-// and jenkins_home as a named volume. See docker-compose.yml in this repo.
+//   2. Both agents must be online (Manage Jenkins → Nodes) before the first
+//      build. If they show up as offline, the JENKINS_SECRET in .env (used by
+//      docker-compose.yml) does not match the secret the controller issued.
+//      See README §3 to re-issue.
 // =====================================================================================
 
 pipeline {
@@ -115,16 +122,13 @@ pipeline {
     stages {
 
         // ============================================================
-        // AGENT 1 — build-agent
+        // AGENT 1 — agent-build (persistent)
         // Does everything BUILD-related: Checkout + Build.
-        // One ephemeral Docker container runs both sub-stages, then is torn down.
+        // Runs on the always-on jenkins-agent-build container (label: build).
         // ============================================================
         stage('Build & Package') {
             agent {
-                docker {
-                    image 'jenkins-agent-with-docker:latest-jdk17'
-                    args '-v /var/run/docker.sock:/var/run/docker.sock --network jenkins_net'
-                }
+                label 'build'
             }
             stages {
 
@@ -165,22 +169,19 @@ pipeline {
             }
             post {
                 always {
-                    echo "build-agent finished — container will be torn down"
+                    echo "build stage finished on agent-build (agent stays online)"
                 }
             }
         }
 
         // ============================================================
-        // AGENT 2 — push-agent
+        // AGENT 2 — agent-push (persistent)
         // Does everything PUSH-related: Docker Hub authentication + push.
-        // One ephemeral Docker container, single stage, then torn down.
+        // Runs on the always-on jenkins-agent-push container (label: push).
         // ============================================================
         stage('Push to Docker Hub') {
             agent {
-                docker {
-                    image 'jenkins-agent-with-docker:latest-jdk17'
-                    args '-v /var/run/docker.sock:/var/run/docker.sock --network jenkins_net'
-                }
+                label 'push'
             }
             steps {
                 echo "Pushing image: ${env.FULL_IMAGE}"
@@ -193,15 +194,14 @@ pipeline {
                         echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
                         docker push ${FULL_IMAGE}
                         # No `docker logout` here: withCredentials already scopes
-                        # DOCKER_USER/DOCKER_PASS to this step, and the agent is
-                        # torn down immediately after the stage ends. Any failure
-                        # in logout would mask a successful push.
+                        # DOCKER_USER/DOCKER_PASS to this step. Any failure in
+                        # logout would mask a successful push.
                     '''
                 }
             }
             post {
                 always {
-                    echo "push-agent finished — container will be torn down"
+                    echo "push stage finished on agent-push (agent stays online)"
                 }
             }
         }
@@ -210,8 +210,5 @@ pipeline {
     post {
         success { echo "Pushed: ${env.FULL_IMAGE}" }
         failure { echo "Build failed for ${params.BRANCH}/${params.ENVIRONMENT}" }
-        cleanup {
-            sh "docker rmi ${env.FULL_IMAGE} || true"
-        }
     }
 }

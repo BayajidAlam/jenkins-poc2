@@ -1,0 +1,52 @@
+# =====================================================================================
+# Dockerfile.agent — Custom Jenkins agent with docker CLI installed.
+#
+# Why this exists:
+#   The official `jenkins/agent:latest-jdk17` image does NOT include the docker
+#   CLI. Our two-agent Jenkinsfile runs `docker build` and `docker push` from
+#   inside the agent container (DooD pattern via /var/run/docker.sock), so we
+#   need a docker CLI inside the agent.
+#
+# Build and tag:
+#   docker build -f Dockerfile.agent -t jenkins-agent-with-docker:latest-jdk17 .
+#
+# Then change the Jenkinsfile:
+#   agent {
+#       docker {
+#           image 'jenkins-agent-with-docker:latest-jdk17'
+#           args '-v /var/run/docker.sock:/var/run/docker.sock --network jenkins_net'
+#       }
+#   }
+#
+# Or pre-build and push to a registry the controller can pull from. Since this
+# image is large (~900 MB), we recommend building it ONCE on the host and
+# letting both agents reuse it.
+# =====================================================================================
+
+FROM jenkins/agent:latest-jdk17
+
+USER root
+
+# Install docker CLI (NOT the daemon — the daemon is the host's, exposed via socket)
+# We use the official docker convenience script to get a docker-cli version
+# compatible with the host's daemon. apt's docker.io on debian-slim can lag
+# behind by a minor version.
+ARG DOCKER_VERSION=29.6.1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+ && curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz \
+      -o /tmp/docker.tgz \
+ && tar -xzf /tmp/docker.tgz -C /tmp \
+ && mv /tmp/docker/docker /usr/local/bin/docker \
+ && chmod +x /usr/local/bin/docker \
+ && rm -rf /tmp/docker /tmp/docker.tgz \
+ && apt-get purge -y curl gnupg \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
+
+# Drop back to the jenkins user so the agent runs with the expected identity
+USER jenkins
+
+# Sanity check — should print the docker CLI version
+RUN docker --version

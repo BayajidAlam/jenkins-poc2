@@ -1,14 +1,7 @@
 // =====================================================================================
-// Jenkinsfile — SINGLE SOURCE OF TRUTH for this pipeline's contract.
-// If you change anything about how this pipeline behaves, change it HERE.
-//
-// What this pipeline does:
-//   1. Launches an ephemeral Docker agent (Verify stage) to prove the on-demand
-//      agent model + host Docker socket work.
-//   2. Checks out the selected GitHub branch.
-//   3. Builds an nginx-based static-site image, substituting IMAGE_TAG and
-//      DOCKERHUB_USER placeholders in index.html via Docker ARG → sed.
-//   4. Pushes the image to Docker Hub, tagged per the convention below.
+// Jenkinsfile — TWO-AGENT MODEL (on-demand Docker containers)
+//   - build-agent : Checkout + Build (all build-related stages) — one ephemeral container
+//   - push-agent  : Push to Docker Hub (all push-related stages) — one ephemeral container
 //
 // Architecture: on-demand Docker agents. The Jenkins controller runs persistently;
 // agents are ephemeral containers launched per-stage via the Docker Pipeline plugin
@@ -46,6 +39,14 @@
 //   plain-credentials (default), Docker Pipeline (docker-workflow),
 //   Git Parameter (git-parameter).
 //
+// Agent image (custom — see Dockerfile.agent):
+//   We do NOT use the upstream `jenkins/agent:latest-jdk17` because that image
+//   has no docker CLI. Our pipeline runs `docker build` and `docker push`
+//   inside the agent (DooD via /var/run/docker.sock), so we need a docker CLI
+//   in the agent. Build the custom image once with:
+//       docker build -f Dockerfile.agent -t jenkins-agent-with-docker:latest-jdk17 .
+//   The custom image is ~520 MB and is reused across all builds.
+//
 // First-build gotchas (these always hit on a fresh job — they are NOT bugs):
 //   1. "script not yet approved for use" — fix at
 //      Manage Jenkins → In-process Script Approval → Approve each pending hash,
@@ -55,8 +56,9 @@
 //          sa.pendingScripts.each { sa.approveScript(it.hash) }
 //          sa.save()
 //      Then click Build with Parameters again.
-//   2. The first build of each stage downloads jenkins/agent:latest-jdk17 (~700 MB)
-//      and pulls nginx:alpine during Build. Subsequent builds reuse the cache.
+//   2. The first build pulls jenkins-agent-with-docker:latest-jdk17 (~520 MB,
+//      built locally from Dockerfile.agent) and nginx:alpine during Build.
+//      Subsequent builds reuse the cache.
 //
 // docker-compose.yml must run Jenkins as root with /var/run/docker.sock bind-mounted
 // and jenkins_home as a named volume. See docker-compose.yml in this repo.
@@ -100,96 +102,83 @@ pipeline {
     }
 
     environment {
-        DATE_TAG       = sh(script: "date +%Y%m%d",               returnStdout: true).trim()
-        SHORT_HASH     = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-        CONTAINER_NAME = "${params.BRANCH}-${params.ENVIRONMENT}-${DATE_TAG}-${SHORT_HASH}"
-        FULL_IMAGE     = "${params.DOCKER_IMAGE}:${CONTAINER_NAME}"
+        // DATE_TAG is the only thing safe to compute at the controller level —
+        // it's a pure shell call. SHORT_HASH, CONTAINER_NAME, and FULL_IMAGE
+        // depend on a git repo existing, so they are computed inside the
+        // Checkout stage after checkout() has run. Computing them here would
+        // either error (no repo on controller) or produce an empty SHORT_HASH,
+        // resulting in a tag like "main-dev-20260825-" (empty trailing segment)
+        // which breaks `docker push`.
+        DATE_TAG = sh(script: "date +%Y%m%d", returnStdout: true).trim()
     }
 
     stages {
 
-        // STAGE 0 — Automated test: prove the agent-on-demand model works.
-        stage('Verify Agents (Test)') {
+        // ============================================================
+        // AGENT 1 — build-agent
+        // Does everything BUILD-related: Checkout + Build.
+        // One ephemeral Docker container runs both sub-stages, then is torn down.
+        // ============================================================
+        stage('Build & Package') {
             agent {
                 docker {
-                    image 'jenkins/agent:latest-jdk17'
+                    image 'jenkins-agent-with-docker:latest-jdk17'
                     args '-v /var/run/docker.sock:/var/run/docker.sock --network jenkins_net'
                 }
             }
-            steps {
-                echo "=== AGENT LIFECYCLE TEST START ==="
-                echo ""
-                echo "--- (1) Containers running BEFORE this stage's agent ---"
-                sh 'docker ps --format "table {{.Names}}\\t{{.Image}}\\t{{.Status}}"'
-                echo ""
-                echo "--- (2) Containers running WITH this stage's agent included ---"
-                sh '''
-                sleep 2
-                docker ps --format "table {{.Names}}\\t{{.Image}}\\t{{.Status}}"
-                echo ""
-                echo "--- (3) THIS container's identity ---"
-                echo "Hostname:    $(hostname)"
-                echo "Container:   $(cat /etc/hostname)"
-                echo "User:        $(whoami)"
-                echo "Workspace:   $(pwd)"
-                echo ""
-                echo "--- (4) Docker socket reachable from agent ---"
-                docker version --format 'Server: {{.Server.Version}}' || echo "DOCKER SOCKET NOT MOUNTED"
-                echo ""
-                echo "--- (5) JNLP handshake evidence ---"
-                echo "JENKINS_URL=${JENKINS_URL:-<not set>}"
-                echo "JENKINS_NODE_NAME=${JENKINS_NODE_NAME:-<not set>}"
-                echo "JENKINS_SECRET=${JENKINS_SECRET:+<redacted>}"
-                '''
-                echo ""
-                echo "=== AGENT LIFECYCLE TEST END ==="
+            stages {
+
+                stage('Checkout') {
+                    steps {
+                        echo "Checkout branch: ${params.BRANCH} from ${params.GIT_REPO}"
+                        checkout([$class: 'GitSCM',
+                            branches: [[name: "*/${params.BRANCH}"]],
+                            userRemoteConfigs: [[
+                                url: params.GIT_REPO,
+                                credentialsId: 'github-pat'
+                            ]]
+                        ])
+                        script {
+                            // Compute the unique image tag here, AFTER checkout,
+                            // so git rev-parse has a real repo to read from.
+                            env.SHORT_HASH         = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                            env.CONTAINER_NAME     = "${params.BRANCH}-${params.ENVIRONMENT}-${DATE_TAG}-${env.SHORT_HASH}"
+                            env.FULL_IMAGE         = "${params.DOCKER_IMAGE}:${env.CONTAINER_NAME}"
+                            env.DOCKERHUB_USER_REPO = params.DOCKER_IMAGE.split('/')[0]
+                            echo "Resolved image tag: ${env.FULL_IMAGE}"
+                        }
+                    }
+                }
+
+                stage('Build') {
+                    steps {
+                        echo "Building image: ${env.FULL_IMAGE}"
+                        // DOCKERHUB_USER_REPO was already resolved in the Checkout stage.
+                        sh '''
+                            docker build \
+                                --build-arg IMAGE_TAG=${CONTAINER_NAME} \
+                                --build-arg DOCKERHUB_USER=${DOCKERHUB_USER_REPO} \
+                                -t ${FULL_IMAGE} .
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    echo "build-agent finished — container will be torn down"
+                }
             }
         }
 
-        stage('Checkout') {
-            agent {
-                docker {
-                    image 'jenkins/agent:latest-jdk17'
-                    args '-v /var/run/docker.sock:/var/run/docker.sock --network jenkins_net'
-                }
-            }
-            steps {
-                echo "Checkout branch: ${params.BRANCH} from ${params.GIT_REPO}"
-                checkout([$class: 'GitSCM',
-                    branches: [[name: "*/${params.BRANCH}"]],
-                    userRemoteConfigs: [[
-                        url: params.GIT_REPO,
-                        credentialsId: 'github-pat'
-                    ]]
-                ])
-            }
-        }
-
-        stage('Build') {
-            agent {
-                docker {
-                    image 'jenkins/agent:latest-jdk17'
-                    args '-v /var/run/docker.sock:/var/run/docker.sock --network jenkins_net'
-                }
-            }
-            steps {
-                echo "Building image: ${env.FULL_IMAGE}"
-                script {
-                    env.DOCKERHUB_USER_REPO = params.DOCKER_IMAGE.split('/')[0]
-                }
-                sh '''
-                    docker build \
-                        --build-arg IMAGE_TAG=${CONTAINER_NAME} \
-                        --build-arg DOCKERHUB_USER=${DOCKERHUB_USER_REPO} \
-                        -t ${FULL_IMAGE} .
-                '''
-            }
-        }
-
+        // ============================================================
+        // AGENT 2 — push-agent
+        // Does everything PUSH-related: Docker Hub authentication + push.
+        // One ephemeral Docker container, single stage, then torn down.
+        // ============================================================
         stage('Push to Docker Hub') {
             agent {
                 docker {
-                    image 'jenkins/agent:latest-jdk17'
+                    image 'jenkins-agent-with-docker:latest-jdk17'
                     args '-v /var/run/docker.sock:/var/run/docker.sock --network jenkins_net'
                 }
             }
@@ -203,8 +192,16 @@ pipeline {
                     sh '''
                         echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
                         docker push ${FULL_IMAGE}
-                        docker logout
+                        # No `docker logout` here: withCredentials already scopes
+                        # DOCKER_USER/DOCKER_PASS to this step, and the agent is
+                        # torn down immediately after the stage ends. Any failure
+                        # in logout would mask a successful push.
                     '''
+                }
+            }
+            post {
+                always {
+                    echo "push-agent finished — container will be torn down"
                 }
             }
         }

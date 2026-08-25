@@ -1,0 +1,43 @@
+version: "3.8"
+
+# This stack runs ONLY the Jenkins controller.
+# The build agent and push agent are NOT here — they are launched
+# on-demand by the Jenkinsfile itself via the Docker Pipeline plugin.
+#
+# On-demand strategy: agents spin up when a build starts, shut down when done.
+# Resource-efficient, clean isolation per build, no idle container cost.
+
+services:
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17
+    container_name: jenkins-controller
+    restart: unless-stopped
+    user: root   # Required so the container can launch sibling agent containers via the mounted Docker socket
+    ports:
+      - "8080:8080"    # Web UI
+      - "50000:50000"  # JNLP — agents dial back to the controller on this port
+    volumes:
+      # Named volume — survives container restarts. All Jenkins config,
+      # jobs, credentials, plugins, and build history live here.
+      - jenkins_home:/var/jenkins_home
+
+      # Bind-mount the host Docker socket so the Jenkins container can
+      # launch agent containers using the host's Docker daemon.
+      # This is the standard Docker-out-of-Docker pattern (DooD):
+      # the agent containers share the host's Docker engine, avoiding
+      # the complications of true Docker-in-Docker (DinD).
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - jenkins_net
+    environment:
+      # Allow long JNLP connections from agents
+      - JENKINS_OPTS=--httpPort=8080
+
+networks:
+  jenkins_net:
+    name: jenkins_net
+    driver: bridge
+
+volumes:
+  jenkins_home:
+    name: jenkins_home

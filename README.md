@@ -5,6 +5,8 @@ image to Docker Hub. Every parameterized build spins up its own ephemeral Docker
 agents (launched by the controller, torn down when the stage finishes) and produces
 a uniquely-tagged image.
 
+<img width="1638" height="805" alt="image" src="https://github.com/user-attachments/assets/06d99555-1832-4e47-b0b6-6d308598d15c" />
+
 > **The `Jenkinsfile` is the single source of truth for this pipeline's contract.**
 > All parameters, defaults, credential IDs, plugin requirements, naming convention,
 > and first-build gotchas are documented in the comment block at the top of

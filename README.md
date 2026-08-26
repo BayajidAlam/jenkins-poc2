@@ -5,7 +5,8 @@ image to Docker Hub. The Jenkins controller **and both agents** run as persisten
 services in `docker-compose.yml` - there is no per-stage container spin-up. Every
 parameterized build produces a uniquely-tagged image.
 
-<img width="616" height="419" alt="image" src="https://github.com/user-attachments/assets/1d47f36d-2a1c-434e-a085-7176162d88fa" />
+<img width="740" height="415" alt="Screenshot 2026-08-26 123045" src="https://github.com/user-attachments/assets/2a9bdb87-679c-4361-8832-ed326634b0eb" />
+
 
 
 > **The `Jenkinsfile` is the single source of truth for this pipeline's contract.**
